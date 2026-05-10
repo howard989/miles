@@ -103,17 +103,21 @@ async def run_async_train_loop(
         rollout_data_next_future = None
         _log.info("[loop] rollout_id=%d step1: await rollout_data done", rollout_id)
 
-        _log.info("[loop] rollout_id=%d step2: before_step start", rollout_id)
-        await before_step(rollout_id)
-        _log.info("[loop] rollout_id=%d step2: before_step done", rollout_id)
+        before_ok = False
+        try:
+            _log.info("[loop] rollout_id=%d step2: before_step start", rollout_id)
+            await before_step(rollout_id)
+            before_ok = True
+            _log.info("[loop] rollout_id=%d step2: before_step done", rollout_id)
 
-        _log.info("[loop] rollout_id=%d step3: train_group.train start", rollout_id)
-        await train_group.train(rollout_id, rollout_data_curr_ref)
-        _log.info("[loop] rollout_id=%d step3: train_group.train done", rollout_id)
-
-        _log.info("[loop] rollout_id=%d step4: after_step start", rollout_id)
-        await after_step(rollout_id)
-        _log.info("[loop] rollout_id=%d step4: after_step done", rollout_id)
+            _log.info("[loop] rollout_id=%d step3: train_group.train start", rollout_id)
+            await train_group.train(rollout_id, rollout_data_curr_ref)
+            _log.info("[loop] rollout_id=%d step3: train_group.train done", rollout_id)
+        finally:
+            if before_ok:
+                _log.info("[loop] rollout_id=%d step4: after_step start", rollout_id)
+                await after_step(rollout_id)
+                _log.info("[loop] rollout_id=%d step4: after_step done", rollout_id)
 
         # 5) Optional save (gated; smoke disables via --save "").
         if getattr(args, "save", None):
