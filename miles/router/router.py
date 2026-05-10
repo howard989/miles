@@ -253,6 +253,15 @@ class MilesRouter:
                 "status_code": status_code,
                 "headers": response_headers,
             }
+        except Exception:
+            logger.exception(
+                "[miles-router] proxy failed method=%s path=%s worker_url=%s state=%s",
+                request.method,
+                path,
+                worker_url,
+                self._diagnostic_state(),
+            )
+            raise
         finally:
             self._finish_url(worker_url)
 
@@ -388,6 +397,22 @@ class MilesRouter:
         """List all registered workers"""
         return {"urls": list(self.worker_request_counts.keys())}
 
+    def _diagnostic_state(self) -> dict:
+        """Return the router state needed to diagnose shared-topology stalls."""
+        candidates = sorted(self._candidate_set())
+        return {
+            "pipeline_id": getattr(self.args, "pipeline_id", None),
+            "pipeline_index": getattr(self.args, "pipeline_index", None),
+            "admission_declared": bool(self._admission_declared),
+            "candidate_workers": candidates,
+            "candidate_count": len(candidates),
+            "enabled_workers": sorted(self.enabled_workers),
+            "dead_workers": sorted(self.dead_workers),
+            "worker_request_counts": dict(self.worker_request_counts),
+            "worker_failure_counts": dict(self.worker_failure_counts),
+            "worker_engine_index_map": dict(self.worker_engine_index_map),
+        }
+
     async def admission_state(self, request: Request):
         """F76 DEV-ONLY-MVP test diagnostic endpoint.
 
@@ -401,15 +426,7 @@ class MilesRouter:
         deployments leave the env flag off so this endpoint is absent
         from the FastAPI app entirely.
         """
-        return {
-            "pipeline_id": getattr(self.args, "pipeline_id", None),
-            "admission_declared": bool(self._admission_declared),
-            "enabled_workers": sorted(self.enabled_workers),
-            "dead_workers": sorted(self.dead_workers),
-            "worker_request_counts": dict(self.worker_request_counts),
-            "worker_failure_counts": dict(self.worker_failure_counts),
-            "worker_engine_index_map": dict(self.worker_engine_index_map),
-        }
+        return self._diagnostic_state()
 
     # ------------------------------------------------------------------
     # F3 admission lifecycle helpers — stay sync per scope F14. Only the

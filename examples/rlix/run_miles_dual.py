@@ -199,6 +199,10 @@ def _build_pipeline(
         )
     train_mapping = list(pipeline_pool[:train_size])
     infer_mapping = list(pipeline_pool)
+    # Probe-only observability: thread identity into rollout/train logs and
+    # router diagnostic endpoints so shared-topology stalls can be attributed.
+    setattr(args, "pipeline_id", pipeline_id)
+    setattr(args, "pipeline_index", pipeline_index)
     logger.info(
         "[run_miles_dual] mp%d allocated pipeline_id=%s namespace=%s "
         "train=%s infer=%s",
@@ -247,6 +251,11 @@ def _build_pipeline(
         # not race for the same port window.
         "MILES_ROLLOUT_BASE_PORT": str(15000 + pipeline_index * 1000),
     }
+    if str(getattr(base_args, "dual_topology", "disjoint")) == "shared" or (
+        os.environ.get("MILES_DEBUG_SHARED_PROBE") == "1"
+    ):
+        pipeline_runtime_env_vars["MILES_DEBUG_SHARED_PROBE"] = "1"
+        pipeline_runtime_env_vars["MILES_ROUTER_TEST_HOOKS"] = "1"
     if pythonpath := os.environ.get("PYTHONPATH"):
         pipeline_runtime_env_vars["PYTHONPATH"] = pythonpath
     for _k in (
@@ -419,6 +428,7 @@ def main():
             rollout_manager=rollout_manager,
             before_step=_before,
             after_step=_after,
+            loop_label=f"mp{idx} pipeline_id={pid}",
         )
         logger.info("[run_miles_dual] mp%d training loop complete pipeline_id=%s", idx, pid)
 

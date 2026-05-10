@@ -37,6 +37,23 @@ from miles.utils.misc import should_run_periodic_action
 StepHook = Callable[[int], Awaitable[None]]
 
 
+def _loop_prefix(args: Any, loop_label: str | None) -> str:
+    """Build a stable log prefix for multi-pipeline RCA runs."""
+    if loop_label:
+        return f"[loop {loop_label}]"
+    pipeline_id = getattr(args, "pipeline_id", None)
+    pipeline_index = getattr(args, "pipeline_index", None)
+    exp_name = getattr(args, "exp_name", None)
+    parts = []
+    if pipeline_index is not None:
+        parts.append(f"mp={pipeline_index}")
+    if pipeline_id:
+        parts.append(f"pipeline_id={pipeline_id}")
+    if exp_name:
+        parts.append(f"exp={exp_name}")
+    return f"[loop {' '.join(parts)}]" if parts else "[loop]"
+
+
 async def run_async_train_loop(
     args: Any,
     *,
@@ -45,6 +62,7 @@ async def run_async_train_loop(
     before_step: StepHook,
     after_step: StepHook,
     num_rollout_per_epoch: Optional[int] = None,
+    loop_label: str | None = None,
 ) -> None:
     """RLix-mode async training loop.
 
@@ -90,30 +108,31 @@ async def run_async_train_loop(
 
     _log = _logging.getLogger("rlix_train_loop")
     _log.setLevel(_logging.INFO)
+    prefix = _loop_prefix(args, loop_label)
 
     # Pre-loop priming: dispatch the first rollout. The base v=-1 weight
     # sync MUST already have been driven by the caller (driver) so this
     # rollout sees correctly-versioned weights.
-    _log.info("[loop] pre-loop generate dispatch rollout_id=%d", start_rollout_id)
+    _log.info("%s pre-loop generate dispatch rollout_id=%d", prefix, start_rollout_id)
     rollout_data_next_future = rollout_manager.generate.remote(start_rollout_id)
 
     for rollout_id in range(start_rollout_id, num_rollout):
-        _log.info("[loop] rollout_id=%d step1: await rollout_data start", rollout_id)
+        _log.info("%s rollout_id=%d step1: await rollout_data start", prefix, rollout_id)
         rollout_data_curr_ref = await rollout_data_next_future
         rollout_data_next_future = None
-        _log.info("[loop] rollout_id=%d step1: await rollout_data done", rollout_id)
+        _log.info("%s rollout_id=%d step1: await rollout_data done", prefix, rollout_id)
 
-        _log.info("[loop] rollout_id=%d step2: before_step start", rollout_id)
+        _log.info("%s rollout_id=%d step2: before_step start", prefix, rollout_id)
         await before_step(rollout_id)
-        _log.info("[loop] rollout_id=%d step2: before_step done", rollout_id)
+        _log.info("%s rollout_id=%d step2: before_step done", prefix, rollout_id)
 
-        _log.info("[loop] rollout_id=%d step3: train_group.train start", rollout_id)
+        _log.info("%s rollout_id=%d step3: train_group.train start", prefix, rollout_id)
         await train_group.train(rollout_id, rollout_data_curr_ref)
-        _log.info("[loop] rollout_id=%d step3: train_group.train done", rollout_id)
+        _log.info("%s rollout_id=%d step3: train_group.train done", prefix, rollout_id)
 
-        _log.info("[loop] rollout_id=%d step4: after_step start", rollout_id)
+        _log.info("%s rollout_id=%d step4: after_step start", prefix, rollout_id)
         await after_step(rollout_id)
-        _log.info("[loop] rollout_id=%d step4: after_step done", rollout_id)
+        _log.info("%s rollout_id=%d step4: after_step done", prefix, rollout_id)
 
         # 5) Optional save (gated; smoke disables via --save "").
         if getattr(args, "save", None):
@@ -141,6 +160,7 @@ async def run_async_train_loop(
         # 7) Dispatch the next rollout AFTER actor_train is released, so
         #    the new rollout does not race for partial-overlap GPUs.
         if rollout_id + 1 < num_rollout:
+            _log.info("%s dispatch next rollout_id=%d", prefix, rollout_id + 1)
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
 

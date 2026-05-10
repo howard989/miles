@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import dataclasses
 import logging
+import os
 import queue
 import threading
 import time
@@ -70,6 +71,22 @@ class _CachedWeightVersion:
 _cached_version = _CachedWeightVersion()
 
 
+def _shared_probe_enabled() -> bool:
+    return os.environ.get("MILES_DEBUG_SHARED_PROBE") == "1"
+
+
+async def _probe_router_admission_state(args) -> dict:
+    """Best-effort router snapshot for shared-topology RCA runs."""
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/admission_state"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                data = await resp.json()
+                return {"status": resp.status, "body": data}
+    except Exception as exc:  # noqa: BLE001 - probe path should not break rollout.
+        return {"error": repr(exc)}
+
+
 # Global worker manager
 _global_worker = None
 _worker_lock = threading.Lock()
@@ -109,6 +126,49 @@ class AsyncRolloutWorker:
         self.output_queue = queue.Queue(maxsize=1000)  # Continuous output queue
         self.worker_thread = None
         self.state = GenerateState(args)
+        self._debug_lock = threading.Lock()
+        self._debug_active_tasks = 0
+        self._debug_started_groups = 0
+        self._debug_completed_callbacks = 0
+        self._debug_fatal_callbacks = 0
+        self._debug_task_errors = 0
+        self._debug_last_error: str | None = None
+
+    def _set_active_task_count(self, count: int) -> None:
+        with self._debug_lock:
+            self._debug_active_tasks = count
+
+    def _record_started_group(self) -> None:
+        with self._debug_lock:
+            self._debug_started_groups += 1
+
+    def _record_completed_callback(self) -> None:
+        with self._debug_lock:
+            self._debug_completed_callbacks += 1
+
+    def _record_fatal_callback(self, exc: BaseException) -> None:
+        with self._debug_lock:
+            self._debug_fatal_callbacks += 1
+            self._debug_last_error = repr(exc)
+
+    def _record_task_error(self, exc: BaseException) -> None:
+        with self._debug_lock:
+            self._debug_task_errors += 1
+            self._debug_last_error = repr(exc)
+
+    def debug_snapshot(self) -> dict:
+        with self._debug_lock:
+            return {
+                "running": bool(self.running),
+                "thread_alive": bool(self.worker_thread and self.worker_thread.is_alive()),
+                "active_tasks": self._debug_active_tasks,
+                "started_groups": self._debug_started_groups,
+                "completed_callbacks": self._debug_completed_callbacks,
+                "fatal_callbacks": self._debug_fatal_callbacks,
+                "task_errors": self._debug_task_errors,
+                "last_error": self._debug_last_error,
+                "output_queue_size": self.get_queue_size(),
+            }
 
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
@@ -127,8 +187,10 @@ class AsyncRolloutWorker:
                         try:
                             task.result()  # Results are already handled in callbacks
                         except Exception as e:
+                            self._record_task_error(e)
                             print(f"Task failed with exception: {e}")
                     active_tasks -= done_tasks
+                    self._set_active_task_count(len(active_tasks))
 
                 # If active task count hasn't reached limit, try to get new data and start tasks
                 while len(active_tasks) < max_concurrent_tasks and self.running:
@@ -160,20 +222,28 @@ class AsyncRolloutWorker:
                                 try:
                                     result = done_task.result()
                                 except (EnginePreemptedError, RLixRouterMetadataError) as fatal:
+                                    self._record_fatal_callback(fatal)
                                     self.output_queue.put((gid, _FatalError(inner=fatal)))
                                     return
+                                except Exception as exc:
+                                    self._record_task_error(exc)
+                                    raise
+                                self._record_completed_callback()
                                 self.output_queue.put((gid, result))
 
                             return task_done_callback
 
                         task.add_done_callback(make_callback(group_id))
                         active_tasks.add(task)
+                        self._record_started_group()
+                        self._set_active_task_count(len(active_tasks))
                         break
 
                 # Brief sleep to avoid busy waiting
                 await asyncio.sleep(1)
 
             except Exception as e:
+                self._record_task_error(e)
                 print(f"Error in continuous worker loop: {e}")
                 await asyncio.sleep(1)
 
@@ -395,6 +465,20 @@ async def generate_rollout_async(
                 f"Queue size: {worker.get_queue_size()}, "
                 f"Collected: {len(data)}/{target_data_size}"
             )
+            if _shared_probe_enabled():
+                router_state = await _probe_router_admission_state(args)
+                print(
+                    "[shared-probe] no-progress snapshot: "
+                    f"pipeline_index={getattr(args, 'pipeline_index', None)} "
+                    f"pipeline_id={getattr(args, 'pipeline_id', None)} "
+                    f"exp_name={getattr(args, 'exp_name', None)} "
+                    f"rollout_id={rollout_id} "
+                    f"collected={len(data)}/{target_data_size} "
+                    f"completed_buffer={len(completed_groups)} "
+                    f"worker={worker.debug_snapshot()} "
+                    f"router={router_state}",
+                    flush=True,
+                )
             last_progress_time = current_time
 
         # If no results were processed, brief sleep to avoid busy waiting
