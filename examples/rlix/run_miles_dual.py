@@ -63,10 +63,13 @@ def _split_pools_for_dual(
     just maps each pipeline onto its own slice of the physical pool.
     """
     needed = 2 * infer_pool_size
-    if num_gpus_per_node < needed:
+    if num_gpus_per_node != needed:
         raise ValueError(
-            f"need {needed} GPUs for 2 pipelines (each infer_pool={infer_pool_size}), "
-            f"have num_gpus_per_node={num_gpus_per_node}"
+            f"dual driver expects exactly {needed} visible GPUs "
+            f"(2 pipelines * infer_pool_size={infer_pool_size}); "
+            f"got num_gpus_per_node={num_gpus_per_node}. "
+            "To use a subset of a larger machine, set CUDA_VISIBLE_DEVICES "
+            "before launching the driver."
         )
     physical = list(range(num_gpus_per_node))
     return list(physical[:infer_pool_size]), list(physical[infer_pool_size : 2 * infer_pool_size])
