@@ -44,3 +44,42 @@ def test_split_pools_for_dual_rejects_extra_visible_gpus(monkeypatch):
             num_gpus_per_node=5,
             infer_pool_size=2,
         )
+
+
+def test_default_dual_topology_is_disjoint(monkeypatch):
+    """Dual driver keeps the existing disjoint topology unless opted in."""
+    monkeypatch.delenv("MILES_DUAL_TOPOLOGY", raising=False)
+    run_miles_dual = _load_run_miles_dual(monkeypatch)
+
+    assert run_miles_dual._default_dual_topology() == "disjoint"
+
+
+def test_env_can_select_shared_dual_topology(monkeypatch):
+    """Env var can opt into the probe-only shared topology."""
+    run_miles_dual = _load_run_miles_dual(monkeypatch)
+    monkeypatch.setenv("MILES_DUAL_TOPOLOGY", "shared")
+
+    assert run_miles_dual._default_dual_topology() == "shared"
+
+
+def test_invalid_dual_topology_env_raises(monkeypatch):
+    """Invalid topology values fail fast before the driver starts actors."""
+    run_miles_dual = _load_run_miles_dual(monkeypatch)
+    monkeypatch.setenv("MILES_DUAL_TOPOLOGY", "partitioned")
+
+    with pytest.raises(ValueError, match="MILES_DUAL_TOPOLOGY"):
+        run_miles_dual._default_dual_topology()
+
+
+def test_shared_pools_for_dual_returns_same_pool(monkeypatch):
+    """Shared probe maps both pipelines onto the same physical GPU pool."""
+    run_miles_dual = _load_run_miles_dual(monkeypatch)
+
+    pool_p1, pool_p2 = run_miles_dual._shared_pools_for_dual(
+        num_gpus_per_node=4,
+        infer_pool_size=2,
+    )
+
+    assert pool_p1 == [0, 1]
+    assert pool_p2 == [0, 1]
+    assert pool_p1 == pool_p2

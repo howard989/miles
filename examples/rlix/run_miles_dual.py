@@ -1,13 +1,19 @@
 """M11.2 dual-pipeline driver — `examples/rlix/run_miles_dual.py`.
 
 Spawns two MilesCoordinator + MilesPipeline pairs in separate Ray
-namespaces with disjoint ``cluster_device_mappings``. Each pipeline
-runs its own ``rlix_train_loop`` concurrently via ``asyncio.gather``.
+namespaces. By default it uses disjoint ``cluster_device_mappings``;
+``--dual-topology=shared`` is a probe-only path that deliberately maps
+both pipelines onto the same physical GPU pool. Each pipeline runs its
+own ``rlix_train_loop`` concurrently via ``asyncio.gather``.
 
-Topology (Codex-recommended Option A — disjoint pools, no cross-pipeline
-GPU contention):
+Default topology (disjoint pools, no cross-pipeline GPU contention):
     pipeline 1: actor_train=[0,1], actor_infer=[0,1]
     pipeline 2: actor_train=[2,3], actor_infer=[2,3]
+
+Shared topology probe (NOT A FEATURE; expected to expose the first
+scheduler/placement blocker):
+    pipeline 1: actor_train=[0], actor_infer=[0,1]
+    pipeline 2: actor_train=[0], actor_infer=[0,1]
 
 This is the minimum-viable M11.2 PASS — proves two pipelines can register
 + initialize + train + sync + generate + clean up concurrently without
@@ -39,6 +45,10 @@ from __future__ import annotations
 import copy
 import os
 import sys
+
+
+_DUAL_TOPOLOGY_ENV = "MILES_DUAL_TOPOLOGY"
+_DUAL_TOPOLOGIES = ("disjoint", "shared")
 
 # F08 / F41 — fail fast if RLix entry is invoked without the env var.
 # The check must happen BEFORE any heavy import (torch / sglang /
@@ -73,6 +83,52 @@ def _split_pools_for_dual(
         )
     physical = list(range(num_gpus_per_node))
     return list(physical[:infer_pool_size]), list(physical[infer_pool_size : 2 * infer_pool_size])
+
+
+def _shared_pools_for_dual(
+    *, num_gpus_per_node: int, infer_pool_size: int
+) -> tuple[list[int], list[int]]:
+    """Return overlapping per-pipeline pools for the shared-topology probe.
+
+    This is intentionally a probe path, not the M11.2 default. It keeps the
+    same whole-machine shape as the disjoint driver (two infer pools worth of
+    visible GPUs), then maps both pipelines to the first pool so RLix must
+    arbitrate cross-pipeline GPU contention.
+    """
+    needed = 2 * infer_pool_size
+    if num_gpus_per_node != needed:
+        raise ValueError(
+            f"shared dual-topology probe expects exactly {needed} visible GPUs "
+            f"(2 pipelines * infer_pool_size={infer_pool_size}); "
+            f"got num_gpus_per_node={num_gpus_per_node}."
+        )
+    pool = list(range(infer_pool_size))
+    return list(pool), list(pool)
+
+
+def _default_dual_topology() -> str:
+    """Read the dual-driver topology mode from env, defaulting to disjoint."""
+    topology = os.environ.get(_DUAL_TOPOLOGY_ENV, "disjoint")
+    if topology not in _DUAL_TOPOLOGIES:
+        raise ValueError(
+            f"{_DUAL_TOPOLOGY_ENV} must be one of {_DUAL_TOPOLOGIES}, got {topology!r}"
+        )
+    return topology
+
+
+def _add_dual_driver_args(parser):
+    """Add probe-only dual-driver args without changing standard MILES args."""
+    parser.add_argument(
+        "--dual-topology",
+        choices=_DUAL_TOPOLOGIES,
+        default=_default_dual_topology(),
+        help=(
+            "Dual-driver topology. 'disjoint' is the M11.2 default. "
+            "'shared' is a probe-only experiment that maps both pipelines "
+            "onto the same GPU pool to expose scheduler/placement blockers."
+        ),
+    )
+    return parser
 
 
 def _per_pipeline_args(base_args, *, pipeline_index: int):
@@ -115,10 +171,12 @@ def _build_pipeline(
 ):
     """Allocate one pipeline_id, register, admit, create coordinator+pipeline.
 
-    ``pipeline_pool`` is the disjoint slice of physical GPUs for THIS
-    pipeline. Within that pool we keep the partial-overlap shape from
-    base_args: train pool = first ``actor_num_gpus_per_node`` GPUs of
-    the pipeline pool, infer pool = full pipeline pool.
+    ``pipeline_pool`` is the physical GPU pool for THIS pipeline. In the
+    default topology each pipeline gets a disjoint slice; in the shared
+    probe both pipelines intentionally receive the same slice. Within
+    that pool we keep the partial-overlap shape from base_args: train
+    pool = first ``actor_num_gpus_per_node`` GPUs of the pipeline pool,
+    infer pool = full pipeline pool.
 
     Returns ``(pipeline_id, namespace, coordinator_handle, pipeline_handle, args)``.
     """
@@ -250,7 +308,7 @@ def main():
 
     configure_logger()
     logger = logging.getLogger("run_miles_dual")
-    base_args = parse_args()
+    base_args = parse_args(add_custom_arguments=_add_dual_driver_args)
 
     # F10 startup fail-fast on the BASE args. Per-pipeline arg overrides
     # below preserve the topology shape (just shrink the GPU pool).
@@ -278,17 +336,26 @@ def main():
     if num_gpus_per_node <= 0:
         raise RuntimeError(
             "run_miles_dual.py requires --num-gpus-per-node to set the whole-"
-            "machine GPU count (so the dual driver can split it into 2 "
-            "disjoint per-pipeline pools)."
+            "machine GPU count (so the dual driver can construct per-pipeline "
+            "GPU pools)."
         )
-    pool_p1, pool_p2 = _split_pools_for_dual(
-        num_gpus_per_node=num_gpus_per_node,
-        infer_pool_size=int(base_args.rollout_num_gpus),
-    )
+    dual_topology = str(getattr(base_args, "dual_topology", "disjoint"))
+    if dual_topology == "disjoint":
+        pool_p1, pool_p2 = _split_pools_for_dual(
+            num_gpus_per_node=num_gpus_per_node,
+            infer_pool_size=int(base_args.rollout_num_gpus),
+        )
+    elif dual_topology == "shared":
+        pool_p1, pool_p2 = _shared_pools_for_dual(
+            num_gpus_per_node=num_gpus_per_node,
+            infer_pool_size=int(base_args.rollout_num_gpus),
+        )
+    else:
+        raise ValueError(f"unsupported dual_topology={dual_topology!r}")
     logger.info(
-        "[run_miles_dual] topology: num_gpus_per_node=%d, P1_pool=%s, P2_pool=%s, "
-        "per-pipeline train_size=%d infer_size=%d",
-        num_gpus_per_node, pool_p1, pool_p2,
+        "[run_miles_dual] topology=%s: num_gpus_per_node=%d, P1_pool=%s, "
+        "P2_pool=%s, per-pipeline train_size=%d infer_size=%d",
+        dual_topology, num_gpus_per_node, pool_p1, pool_p2,
         int(base_args.actor_num_nodes) * int(base_args.actor_num_gpus_per_node),
         int(base_args.rollout_num_gpus),
     )
