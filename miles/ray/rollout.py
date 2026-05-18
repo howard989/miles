@@ -943,13 +943,22 @@ class RolloutManager:
             ray.get([h.release_memory_occupation.remote(tags=None) for h in handles])
             # Step 5: optional post-sleep VRAM assert.
             if post_sleep_vram_threshold_gb is not None:
-                ray.get(
+                observed_vram_gbs = ray.get(
                     [
                         h.assert_post_sleep_vram_below_threshold.remote(
                             threshold_gb=post_sleep_vram_threshold_gb
                         )
                         for h in handles
                     ]
+                )
+                logger.info(
+                    "shrink_engines: post-sleep SGLang residual allocation "
+                    "max=%.3f GiB per_engine=%s threshold=%.3f GiB "
+                    "engine_indices=%s (weight+kvcache+graph)",
+                    max(observed_vram_gbs) if observed_vram_gbs else 0.0,
+                    [round(float(v), 3) for v in observed_vram_gbs],
+                    float(post_sleep_vram_threshold_gb),
+                    indices,
                 )
         except Exception:
             # Reset the abort cache on failure so retry re-aborts new
