@@ -302,6 +302,9 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self._disaggregation_bootstrap_port = server_args_dict.get(
+            "disaggregation_bootstrap_port"
+        )
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -336,26 +339,64 @@ class SGLangEngine(RayActor):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
-        if self.node_rank == 0 and self.router_ip and self.router_port:
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
-                assert (
-                    self.worker_type == "regular"
-                ), "pd disaggregation is not supported in old router or miles router."
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+        if os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1":
+            logger.info(
+                "MILES_INIT_DEFER_ADD_WORKER=1: skipping init-time router "
+                "add_worker for %s:%s",
+                self.server_host,
+                self.server_port,
+            )
+            return
+
+        self.add_to_router()
+
+    def add_to_router(self, engine_index: int | None = None):
+        if self.node_rank != 0 or not (self.router_ip and self.router_port):
+            return None
+        worker_url = f"http://{self.server_host}:{self.server_port}"
+        if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
+            assert (
+                self.worker_type == "regular"
+            ), "pd disaggregation is not supported in old router or miles router."
+            params = {"url": worker_url}
+            if engine_index is not None:
+                params["engine_index"] = int(engine_index)
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/add_worker",
+                params=params,
+            )
+        else:
+            payload = {
+                "url": worker_url,
+                "worker_type": self.worker_type,
+            }
+            if self.worker_type == "prefill":
+                payload["bootstrap_port"] = getattr(
+                    self, "_disaggregation_bootstrap_port", None
                 )
-            else:
-                payload = {
-                    "url": f"http://{self.server_host}:{self.server_port}",
-                    "worker_type": self.worker_type,
-                }
-                if self.worker_type == "prefill":
-                    payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                )
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/workers",
+                json=payload,
+            )
+        response.raise_for_status()
+        return worker_url
+
+    def disable_in_router(self):
+        if self.node_rank != 0 or not (self.router_ip and self.router_port):
+            return None
+        worker_url = f"http://{self.server_host}:{self.server_port}"
+        if self.args.use_miles_router:
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/disable_worker",
+                params={"url": worker_url},
+            )
             response.raise_for_status()
+        else:
+            logger.info(
+                "disable_in_router skipped for non-miles router worker_url=%s",
+                worker_url,
+            )
+        return worker_url
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.

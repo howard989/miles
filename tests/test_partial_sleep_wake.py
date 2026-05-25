@@ -49,6 +49,94 @@ class TestEngineInfoStateMachine(unittest.TestCase):
         self.assertFalse(info.is_shell())
         self.assertTrue(info.is_alive())
 
+    def test_option_beta_init_marks_live_engines_loading(self):
+        from miles.ray.rollout import RolloutManager
+
+        manager = RolloutManager.__new__(RolloutManager)
+        manager._engines = {}
+        manager._get_updatable_server = lambda: mock.Mock(
+            engines=[mock.Mock(), mock.Mock()]
+        )
+
+        with mock.patch.dict(os.environ, {"MILES_INIT_DEFER_ADD_WORKER": "1"}):
+            manager._init_engine_info_table()
+
+        self.assertEqual(
+            {idx: info.state for idx, info in manager._engines.items()},
+            {0: "loading", 1: "loading"},
+        )
+
+    def test_activate_routing_registers_router_before_active_state(self):
+        from miles.ray import rollout as rollout_mod
+
+        manager = rollout_mod.RolloutManager.__new__(rollout_mod.RolloutManager)
+        calls = []
+
+        class _AddToRouter:
+            def remote(self, *, engine_index):
+                calls.append((engine_index, manager._engines[engine_index].state))
+                return f"http://worker-{engine_index}"
+
+        class _Handle:
+            def __init__(self):
+                self.add_to_router = _AddToRouter()
+
+        manager._engines = {
+            0: rollout_mod.EngineInfo(
+                engine_index=0, state="loading", handle=_Handle()
+            ),
+            1: rollout_mod.EngineInfo(
+                engine_index=1, state="loading", handle=_Handle()
+            ),
+        }
+
+        with mock.patch.object(rollout_mod.ray, "get", side_effect=lambda refs: refs):
+            self.assertEqual(manager.activate_routing([1, 0]), [0, 1])
+
+        self.assertEqual(calls, [(0, "loading"), (1, "loading")])
+        self.assertEqual(
+            {idx: info.state for idx, info in manager._engines.items()},
+            {0: "active", 1: "active"},
+        )
+
+    def test_shrink_engines_disables_router_before_abort_and_release(self):
+        from miles.ray import rollout as rollout_mod
+
+        manager = rollout_mod.RolloutManager.__new__(rollout_mod.RolloutManager)
+        order = []
+
+        class _Remote:
+            def __init__(self, name, result):
+                self.name = name
+                self.result = result
+
+            def remote(self, *args, **kwargs):
+                order.append(self.name)
+                return self.result
+
+        class _Handle:
+            def __init__(self):
+                self.disable_in_router = _Remote("disable", "http://worker-0")
+                self.abort_all_requests = _Remote("abort", None)
+                self.is_idle = _Remote("is_idle", True)
+                self.release_memory_occupation = _Remote("release", None)
+
+        manager._engines = {
+            0: rollout_mod.EngineInfo(
+                engine_index=0, state="active", handle=_Handle()
+            )
+        }
+
+        with (
+            mock.patch.object(rollout_mod.ray, "get", side_effect=lambda refs: refs),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertEqual(manager.shrink_engines([0]), [0])
+
+        self.assertLess(order.index("disable"), order.index("abort"))
+        self.assertLess(order.index("abort"), order.index("release"))
+        self.assertEqual(manager._engines[0].state, "offloaded")
+
 
 class TestRouterAdmissionLifecycle(unittest.TestCase):
     """F3a — admission lifecycle 4-state machine.

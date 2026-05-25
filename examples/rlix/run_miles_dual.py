@@ -191,6 +191,7 @@ def _build_pipeline(
     for _k in (
         "MILES_TMS_HOOK_MODE",
         "MILES_MAX_RESIDUAL_GPU_MEM_GB",
+        "MILES_INIT_DEFER_ADD_WORKER",
         "MILES_SKIP_TMS_PAUSE",
         "MILES_SKIP_NODE_PG_PIN",
         "TMS_INIT_ENABLE_CPU_BACKUP",

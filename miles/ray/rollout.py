@@ -192,6 +192,8 @@ class ServerGroup:
                 }.items()
             }
             env_vars.update(dumper_utils.get_sglang_env(self.args))
+            if (value := os.environ.get("MILES_INIT_DEFER_ADD_WORKER")) is not None:
+                env_vars["MILES_INIT_DEFER_ADD_WORKER"] = value
 
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
@@ -585,10 +587,12 @@ class RolloutManager:
     def _init_engine_info_table(self) -> None:
         """Populate :attr:`_engines` from the updatable server's engines.
 
-        Iter 4 scope: only the standalone-style construction is wired here —
-        every engine handle that ``start_rollout_servers`` returned is alive
-        with weights already loaded, so its state is ``active``. Missing /
-        dead handles map to ``shell``.
+        Iter 4 scope: standalone-style construction starts every engine
+        returned by ``start_rollout_servers`` with weights loaded. Legacy
+        mode admits those workers at SGLang init and marks them ``active``.
+        RLix Option beta (``MILES_INIT_DEFER_ADD_WORKER=1``) intentionally
+        skips init-time router admission, so engines start ``loading`` until
+        the pipeline calls ``finish_init_offload``.
 
         Note: the RLix M11.2 init pattern (``all_engine_placements`` plus
         ``active_engine_indices=frozenset()`` to build only metadata slots
@@ -602,13 +606,14 @@ class RolloutManager:
         """
         srv = self._get_updatable_server()
         engines = list(srv.engines) if srv else []
+        init_defer_add_worker = os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1"
         for idx, handle in enumerate(engines):
             if handle is None:
                 self._engines[idx] = EngineInfo(engine_index=idx, state="shell", handle=None)
                 continue
             self._engines[idx] = EngineInfo(
                 engine_index=idx,
-                state="active",
+                state="loading" if init_defer_add_worker else "active",
                 handle=handle,
             )
 
@@ -892,8 +897,9 @@ class RolloutManager:
         indices = self._resolve_engine_indices(engine_indices)
         if not indices:
             return []
-        # Step 1: announce intent (admission close happens at the router via
-        # F3, iter 7+ — manager state alone doesn't gate dispatch in iter 5).
+        # Step 1: announce intent and close router admission before aborting /
+        # draining so no new requests can land on engines that are about to
+        # release memory.
         for idx in indices:
             if self._engines[idx].state == "active":
                 self._engines[idx].state = "disabling"
@@ -902,8 +908,15 @@ class RolloutManager:
         # the already-cached indices and the drain would re-stall.
         try:
             # Steps 2 + 3: abort + drain.
-            self._abort_engines(indices)
             handles = [self._engines[idx].handle for idx in indices]
+            disabled_worker_urls = ray.get([h.disable_in_router.remote() for h in handles])
+            logger.info(
+                "shrink_engines: disabled router workers prior to release "
+                "engine_indices=%s worker_urls=%s",
+                indices,
+                [u for u in disabled_worker_urls if u],
+            )
+            self._abort_engines(indices)
             deadline = time.time() + 30.0  # bounded test-side drain; production hardening = M11.5.
             while time.time() < deadline:
                 verdicts = ray.get([h.is_idle.remote() for h in handles])
@@ -1045,9 +1058,7 @@ class RolloutManager:
     def activate_routing(self, engine_indices: Iterable[int]) -> list[int]:
         """``loading → active`` transition; called by coordinator AFTER sync.
 
-        Iter 5 only updates manager-side state. The router-side admission
-        (``router.add_worker`` with ``engine_index=...``) is wired in iters
-        7–8 + 23 (coordinator orchestrates both manager and router).
+        Re-registers / re-admits workers with the Miles router after sync.
         """
         indices = sorted(set(int(i) for i in engine_indices))
         for idx in indices:
@@ -1059,6 +1070,20 @@ class RolloutManager:
                     f"activate_routing requires state=='loading'; engine_index "
                     f"{idx} is {info.state!r}"
                 )
+        if indices:
+            worker_urls = ray.get(
+                [
+                    self._engines[idx].handle.add_to_router.remote(engine_index=idx)
+                    for idx in indices
+                ]
+            )
+            logger.info(
+                "activate_routing: registered router workers "
+                "engine_indices=%s worker_urls=%s",
+                indices,
+                [u for u in worker_urls if u],
+            )
+        for idx in indices:
             self._engines[idx].state = "active"
         return indices
 
